@@ -12,19 +12,67 @@ def calc_cyclic_matrix_af3(residue_index,
     
   if not head_to_tail and (list_cid_ss is None or list_cid_ss == [] or list_cid_ss == [[]]):
     return [[0]]
+  residue_index = np.asarray(residue_index, dtype=np.int32)
+  if residue_index.ndim != 1 or residue_index.size == 0:
+    raise ValueError('residue_index must be a non-empty one-dimensional array')
+
+  # token_offset is consumed only for pairs of tokens belonging to the same
+  # residue.  It must remain the ordinary token-index difference, especially
+  # for non-standard residues represented by multiple atom tokens.  Applying
+  # residue graph distances here collapses all of those offsets to zero.
+  if token_wise:
+    token_index = np.arange(residue_index.size, dtype=np.int32)
+    return token_index[:, None] - token_index[None, :]
+
   if len(list_cid_ss) > 1:
-    return [[0]]
-  index_residue_1 = np.where(residue_index == 1)[0]
-  n_res = index_residue_1[1] if len(index_residue_1) > 1 else len(residue_index)
-  # m = np.arange(len(n_res))
-  # offset = m[:, None] - m[None, :]
+    raise ValueError('Only one cyclic peptide chain is currently supported')
+
+  # Non-standard polymer residues can be represented by several atom tokens,
+  # all carrying the same residue ID.  Counting occurrences of residue ID 1
+  # therefore mistakes the second atom token for the start of another chain.
+  # Build the topology in residue space and map it back to token space.
+  chain_start = 0
+  if list_cid_ss:
+    chain_number = list_cid_ss[0][0]
+    chain_starts = np.concatenate(
+        ([0], np.flatnonzero(np.diff(residue_index) < 0) + 1)
+    )
+    if not 1 <= chain_number <= len(chain_starts):
+      raise ValueError(f'Invalid cyclic peptide chain index: {chain_number}')
+    chain_start = int(chain_starts[chain_number - 1])
+  chain_end_candidates = np.flatnonzero(
+      np.diff(residue_index[chain_start:]) < 0
+  )
+  chain_end = (
+      chain_start + int(chain_end_candidates[0]) + 1
+      if chain_end_candidates.size
+      else residue_index.size
+  )
+  chain_residue_index = residue_index[chain_start:chain_end]
+  residue_ids = np.unique(chain_residue_index)
+  residue_to_offset = {int(res_id): i for i, res_id in enumerate(residue_ids)}
+
   c1 = []
   c2 = []
-  if len(list_cid_ss) > 0:
-    c1 = [ind - 1 for ind in list_cid_ss[0][1::2]]
-    c2 = [ind - 1 for ind in list_cid_ss[0][2::2]]
-  offset = calc_cyclic_matrix_monomer(n_res, c1, c2, head_to_tail=head_to_tail)
-  return offset
+  if list_cid_ss:
+    topology = list_cid_ss[0]
+    if len(topology) < 3 or (len(topology) - 1) % 2:
+      raise ValueError('Disulfide topology must be [chain, res1, res2, ...]')
+    try:
+      c1 = [residue_to_offset[ind] for ind in topology[1::2]]
+      c2 = [residue_to_offset[ind] for ind in topology[2::2]]
+    except KeyError as exc:
+      raise ValueError(
+          f'Disulfide residue {exc.args[0]} is absent from chain {topology[0]}'
+      ) from exc
+
+  residue_offset = calc_cyclic_matrix_monomer(
+      len(residue_ids), c1, c2, head_to_tail=head_to_tail
+  )
+  token_to_residue = np.array(
+      [residue_to_offset[int(res_id)] for res_id in chain_residue_index]
+  )
+  return residue_offset[np.ix_(token_to_residue, token_to_residue)]
 
 def calc_cyclic_matrix_monomer(n_aa, c1, c2, head_to_tail=False):
   """
@@ -89,4 +137,3 @@ def construct_cyclic_offset_matrix_v20250306(n_res, signal_bug_fix=True,):
     c_offset[a] = -c_offset[a]
   final_offset = c_offset * np.sign(offset)
   return final_offset
-
