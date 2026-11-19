@@ -12,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 import warnings
 from Bio.PDB.PDBExceptions import PDBConstructionWarning
+from ccd_residues import atom14_parent_resname
 
 # Disable Bio.PDB warnings
 warnings.filterwarnings('ignore', category=PDBConstructionWarning)
@@ -40,6 +41,16 @@ ATOM14: Dict[str, Tuple[str, ...]] = {
     'VAL': ('N', 'CA', 'C', 'O', 'CB', 'CG1', 'CG2','OXT'),
     'UNK': (),
 }  # pyformat: disable
+
+# Atom-name differences needed when modified residues are represented by their
+# standard CCD parent in reference-compatible scoring mode.
+PARENT_ATOM_ALIASES = {
+    ('PCA', 'GLN', 'OE1'): 'OE',
+}
+
+def atom14_resname(residue: PDB.Residue) -> str | None:
+    """Return a standard ATOM14 residue name for a PDB residue, if supported."""
+    return atom14_parent_resname(residue.get_resname())
 
 # Define bucket list
 #BUCKETS = [256, 512, 768, 1024, 1280, 1536, 2048, 2560, 3072, 3584, 4096, 4608, 5120]
@@ -76,13 +87,8 @@ def structure_to_array(structure: Structure, chain_ids: List[str] = None) -> np.
         chain_coords_list = []
         
         for res_idx, res in enumerate(chain):
-            if not PDB.is_aa(res):
-                continue
-                
-            # Get residue name
-            resname = res.get_resname()
-            if resname not in ATOM14:
-                print(f"Warning: Residue {resname} not recognized. Skipping.")
+            resname = atom14_resname(res)
+            if resname is None:
                 continue
             
             # Create 24-dimensional zero array
@@ -91,15 +97,15 @@ def structure_to_array(structure: Structure, chain_ids: List[str] = None) -> np.
             # Get atom order for current residue
             atom_order = ATOM14[resname]
             
-            atom_index = 0
-            for atom_name in atom_order:
-                if atom_name in res:
-                    coord = res[atom_name].get_coord()
-                    if atom_index < 24:
-                        res_coords_24[atom_index] = coord
-                        atom_index += 1
-                    else:
-                        break
+            source_resname = res.get_resname().upper()
+            for atom_index, atom_name in enumerate(atom_order):
+                if atom_index >= 24:
+                    break
+                source_atom_name = PARENT_ATOM_ALIASES.get(
+                    (source_resname, resname, atom_name), atom_name
+                )
+                if source_atom_name in res:
+                    res_coords_24[atom_index] = res[source_atom_name].get_coord()
             # Add filled residue coordinates to chain list
             chain_coords_list.append(res_coords_24)
         
@@ -125,7 +131,7 @@ def get_sequence_length(structure: Structure, chain_ids: List[str] = None) -> in
             print(f"Warning: Chain {chain_id} not found in structure")
             continue
         chain = model[chain_id]
-        total_length += len([res for res in chain if PDB.is_aa(res)])
+        total_length += sum(atom14_resname(res) is not None for res in chain)
     return total_length
 
 def infer_fixed_chain_order(structure: Structure) -> Tuple[List[str], List[str]]:
@@ -136,7 +142,7 @@ def infer_fixed_chain_order(structure: Structure) -> Tuple[List[str], List[str]]
     """
     chain_lengths = []
     for chain in structure[0]:
-        length = len([res for res in chain if PDB.is_aa(res)])
+        length = sum(atom14_resname(res) is not None for res in chain)
         if length:
             chain_lengths.append((chain.id, length))
     chain_lengths.sort(key=lambda item: (-item[1], item[0]))
