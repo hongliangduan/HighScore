@@ -1,36 +1,39 @@
-from config import PDB_DIR, CIF_DIR, CSV_PATH
+from config import (
+    PDB_DIR,
+    CIF_DIR,
+    CSV_PATH,
+    STANDARDIZE_MODIFIED_RESIDUES_FOR_SCORING,
+)
 
 from Bio import PDB
 from Bio.PDB import Structure, Model, Chain
 from Bio.PDB import PDBParser, MMCIFIO
 import os
+import json
 import pandas as pd
 from tqdm import tqdm
 import multiprocessing as mp
 from pathlib import Path
 from typing import Dict, Iterable, Tuple
+from ccd_residues import resolve_polymer_residue
 
-# Define dictionary for three-letter to one-letter amino acid conversion
-protein_letters_3to1 = {
-    'ALA': 'A', 'CYS': 'C', 'ASP': 'D', 'GLU': 'E',
-    'PHE': 'F', 'GLY': 'G', 'HIS': 'H', 'ILE': 'I',
-    'LYS': 'K', 'LEU': 'L', 'MET': 'M', 'ASN': 'N',
-    'PRO': 'P', 'GLN': 'Q', 'ARG': 'R', 'SER': 'S',
-    'THR': 'T', 'VAL': 'V', 'TRP': 'W', 'TYR': 'Y',
-    'MSE': 'M'  # Selenomethionine is typically treated as methionine
-}
-
-def get_sequence(chain):
-    """Get amino acid sequence of the chain"""
-    sequence = ""
+def get_sequence_and_modifications(chain):
+    """Return parent sequence plus AF3 modifications for one chain."""
+    sequence = []
+    modifications = []
     for residue in chain:
-        if residue.id[0] == ' ':
-            try:
-                resname = residue.get_resname().upper()
-                sequence += protein_letters_3to1.get(resname, 'X')
-            except:
-                sequence += 'X'
-    return sequence
+        resname = residue.get_resname().upper()
+        resolved = resolve_polymer_residue(resname)
+        if resolved is not None:
+            one_letter, is_modified = resolved
+            sequence.append(one_letter)
+            if is_modified and not STANDARDIZE_MODIFIED_RESIDUES_FOR_SCORING:
+                
+                modifications.append({
+                    'ptmType': resname,
+                    'ptmPosition': len(sequence),
+                })
+    return ''.join(sequence), modifications
 
 def assign_json_chain_ids(chain_sequences: Dict[str, str]) -> Dict[str, str]:
     """Map original PDB chain IDs to JSON chain IDs.
@@ -48,14 +51,30 @@ def assign_json_chain_ids(chain_sequences: Dict[str, str]) -> Dict[str, str]:
     }
 
 def rewrite_atom_site_chain_ids(cif_path: str, json_chain_id: str) -> None:
-    """Force _atom_site label_asym_id/auth_asym_id to match JSON chain id."""
+    """Normalize chain IDs and polymer residue fields in a generated CIF.
+
+    Biopython writes non-standard polymer residues such as HYP as HETATM with
+    an empty label_seq_id. AlphaFold 3 expects polymer residues to have a
+    numeric, continuous label_seq_id, so normalize recognized polymer residues
+    while leaving unrelated ligands untouched.
+    """
     with open(cif_path, 'r') as f:
         lines = f.readlines()
 
     rewritten = []
+    residue_indices = {}
+    next_residue_index = 1
     for line in lines:
         parts = line.split()
         if parts and parts[0] in {'ATOM', 'HETATM'} and len(parts) > 16:
+            residue_name = parts[5].upper()
+            if resolve_polymer_residue(residue_name) is not None:
+                residue_key = (parts[6], parts[15], parts[5])
+                if residue_key not in residue_indices:
+                    residue_indices[residue_key] = next_residue_index
+                    next_residue_index += 1
+                parts[0] = 'ATOM'
+                parts[8] = str(residue_indices[residue_key])
             parts[6] = json_chain_id
             parts[16] = json_chain_id
             line = ' '.join(parts) + '\n'
@@ -72,20 +91,24 @@ def process_single_pdb(args):
         base_name = os.path.splitext(os.path.basename(input_pdb))[0]
         
         original_chain_sequences = {}
+        original_chain_modifications = {}
         
         for chain in structure[0]:
             chain_id = chain.id
-            sequence = get_sequence(chain)
+            sequence, modifications = get_sequence_and_modifications(chain)
             original_chain_sequences[chain_id] = sequence
+            original_chain_modifications[chain_id] = modifications
 
         chain_id_map = assign_json_chain_ids(original_chain_sequences)
         chain_sequences = {}
+        chain_modifications = {}
 
         for chain in structure[0]:
             original_chain_id = chain.id
             json_chain_id = chain_id_map[original_chain_id]
             sequence = original_chain_sequences[original_chain_id]
             chain_sequences[json_chain_id] = sequence
+            chain_modifications[json_chain_id] = original_chain_modifications[original_chain_id]
             new_structure = Structure.Structure("new_structure")
             new_model = Model.Model(0)
             new_structure.add(new_model)
@@ -105,10 +128,10 @@ def process_single_pdb(args):
                     f"{json_chain_id} (length={len(sequence)})"
                 )
         
-        return base_name, chain_sequences
+        return base_name, chain_sequences, chain_modifications
     except Exception as e:
         print(f"\nError processing {input_pdb}: {str(e)}")
-        return None, None
+        return None, None, None
 
 def main():
 
@@ -134,9 +157,11 @@ def main():
     
     # Collect results
     sequences_dict = {}
-    for base_name, chain_sequences in results:
+    modifications_dict = {}
+    for base_name, chain_sequences, chain_modifications in results:
         if base_name is not None:
             sequences_dict[base_name] = chain_sequences
+            modifications_dict[base_name] = chain_modifications
     
     # Find all possible chain IDs and sort them by custom order
     all_chain_ids = set()
@@ -151,6 +176,8 @@ def main():
         row = {'complex': complex_name}
         for chain_id in all_chain_ids:
             row[f'chain_{chain_id}_seq'] = chain_data.get(chain_id, '')
+            modifications = modifications_dict[complex_name].get(chain_id, [])
+            row[f'chain_{chain_id}_modifications'] = json.dumps(modifications)
         rows.append(row)
     
     df = pd.DataFrame(rows)
