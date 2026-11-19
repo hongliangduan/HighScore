@@ -18,3 +18,6 @@ CSV_PATH = BASE_DIR / "/data/chainid.csv"
 NUM_COPIES = 1
 MAX_LENGTH = 3072
 
+# ===== Cycle setting =====
+HEAD_TO_TAIL = False
+STANDARDIZE_MODIFIED_RESIDUES_FOR_SCORING = False
